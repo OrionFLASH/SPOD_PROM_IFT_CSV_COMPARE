@@ -1,0 +1,36 @@
+# Каталоги с данными и результатами (не попадают в репозиторий)
+IN/
+OUT/
+log/
+LOG/
+LOGS/
+
+# Временные файлы Excel
+~$*.xlsx
+*.tmp
+
+# Секретные данные и окружение
+.env
+.env.local
+*.env
+
+# Виртуальное окружение
+.venv/
+venv/
+env/
+
+# Кэш и служебные файлы
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+dist/
+build/
+
+# IDE и ОС
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
