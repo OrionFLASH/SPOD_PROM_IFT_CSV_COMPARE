@@ -98,7 +98,7 @@ INPUT_FILES: list[dict[str, Any]] = [
         "file_one": "INDICATOR (PROM) 19-01 v1.csv",
         "file_two": "INDICATOR (PROM) 02-02 v1.csv",
         "sheet": "INDICATOR",
-        "key_columns": ["N"],
+        "key_columns": ["CONTEST_CODE", "INDICATOR_ADD_CALC_TYPE", "INDICATOR_CODE"],
         "max_col_width": 100,
         "freeze": "B2",
         "col_width_mode": "AUTO",
@@ -384,6 +384,8 @@ class MergeCompareResult:
     rows_one: list[dict[str, str]]
     headers_two: list[str]
     rows_two: list[dict[str, str]]
+    # Ключевые колонки (порядок для вывода ключа в COMPARE)
+    key_columns: list[str]
 
 
 def process_one_file(
@@ -416,6 +418,7 @@ def process_one_file(
         rows_one=[],
         headers_two=[],
         rows_two=[],
+        key_columns=key_columns,
     )
 
     # Загрузка текущего и нового файлов
@@ -451,9 +454,6 @@ def process_one_file(
         if col not in set_new:
             header_flags[i] = True  # только в текущем — красный
 
-    result.headers_merge = headers_merge
-    result.header_flags = header_flags
-
     idx_current = build_index(result.headers_one, result.rows_one, key_columns, logger=logger)
     idx_new = build_index(result.headers_two, result.rows_two, key_columns, logger=logger)
     all_keys = sorted(set(idx_current.keys()) | set(idx_new.keys()))
@@ -462,7 +462,8 @@ def process_one_file(
 
     # Сборка MERGE: для каждого уникального ключа берём строку из текущего,
     # затем перезаписываем значениями из нового там, где они есть; отличия
-    # фиксируем в compare_rows для листа COMPARE.
+    # фиксируем в compare_rows для листа COMPARE. Ключи с правками — для колонки CHANGE.
+    keys_with_changes: set[tuple[str, ...]] = set()
     for key in all_keys:
         row_current = idx_current.get(key)
         row_new = idx_new.get(key)
@@ -474,6 +475,7 @@ def process_one_file(
             if row_new is not None and col in row_new:
                 if val_cur != val_new:
                     merged_row[col] = val_new
+                    keys_with_changes.add(key)
                     result.compare_rows.append({
                         "key": key,
                         "column": col,
@@ -483,38 +485,60 @@ def process_one_file(
                     })
             elif row_current is not None:
                 merged_row[col] = val_cur
+        # Колонка CHANGE в конце листа: NEW — ключа не было в ONE, DEL — ключа нет в TWO, CHANGE — правки по строке
+        if row_current is None:
+            merged_row["CHANGE"] = "NEW"
+        elif row_new is None:
+            merged_row["CHANGE"] = "DEL"
+        elif key in keys_with_changes:
+            merged_row["CHANGE"] = "CHANGE"
+        else:
+            merged_row["CHANGE"] = "-"
         result.rows_merge.append(merged_row)
+    result.headers_merge = headers_merge + ["CHANGE"]
+    result.header_flags = header_flags + [False]
 
-    # Группировка изменений по ключу для листа COMPARE: три строки на правку (ONE, TWO, CHANGE)
+    # Группировка изменений по ключу для листа COMPARE: три строки на правку (ONE, TWO, CHANGE).
+    # Учитываем: (1) ключи с изменением значений колонок — CHANGE; (2) ключи только в ONE — DEL; (3) ключи только в TWO — NEW.
     by_key: dict[tuple[str, ...], list[dict[str, Any]]] = defaultdict(list)
     for rec in result.compare_rows:
         by_key[rec["key"]].append(rec)
+    keys_change = set(by_key.keys())
+    keys_only_one = set(idx_current.keys()) - set(idx_new.keys())
+    keys_only_two = set(idx_new.keys()) - set(idx_current.keys())
+    all_compare_keys = sorted(keys_change | keys_only_one | keys_only_two)
     result.compare_groups = []
-    for change_no, key in enumerate(sorted(by_key.keys()), start=1):
-        recs = by_key[key]
+    for change_no, key in enumerate(all_compare_keys, start=1):
         row_one = dict(idx_current.get(key) or {})
         row_two = dict(idx_new.get(key) or {})
         changes: dict[str, str] = {}
-        for r in recs:
-            col = r["column"]
-            v_cur = r.get("value_current", "")
-            v_new = r.get("value_new", "")
-            loc = r.get("location_in_value", "")
-            # Краткое описание правки: при коротких значениях — «было X → стало Y», иначе — место изменения
-            if len(str(v_cur)) + len(str(v_new)) <= 100:
-                part = f"было: {v_cur} → стало: {v_new}"
-            else:
-                part = "было → стало"
-            if loc:
-                changes[col] = f"{part} ({loc})"
-            else:
-                changes[col] = part
+        if key in keys_only_one:
+            change_type = "DEL"
+        elif key in keys_only_two:
+            change_type = "NEW"
+        else:
+            change_type = "CHANGE"
+            recs = by_key[key]
+            for r in recs:
+                col = r["column"]
+                v_cur = r.get("value_current", "")
+                v_new = r.get("value_new", "")
+                loc = r.get("location_in_value", "")
+                if len(str(v_cur)) + len(str(v_new)) <= 100:
+                    part = f"было: {v_cur} → стало: {v_new}"
+                else:
+                    part = "было → стало"
+                if loc:
+                    changes[col] = f"{part} ({loc})"
+                else:
+                    changes[col] = part
         result.compare_groups.append({
             "change_no": change_no,
             "key": key,
             "row_one": row_one,
             "row_two": row_two,
             "changes": changes,
+            "change_type": change_type,
         })
 
     if logger:
@@ -599,6 +623,7 @@ def _write_compare_sheet(
     ws: Worksheet,
     compare_groups: list[dict[str, Any]],
     headers_merge: list[str],
+    key_columns: list[str],
     bold_header: bool = True,
     logger: Optional[logging.Logger] = None,
 ) -> None:
@@ -606,8 +631,10 @@ def _write_compare_sheet(
     Пишет лист COMPARE: для каждой правки три строки —
     1) ONE: ключ и все значения из текущего файла;
     2) TWO: тот же ключ и все значения из нового файла;
-    3) CHANGE: пометки, в каких колонках и какие были правки.
-    Колонки: № (порядковый номер правки), откуда (ONE/TWO/CHANGE), затем все колонки из MERGE.
+    3) CHANGE: ключ (для привязки к строке) + пометки по колонкам (что поменялось) или DEL/NEW.
+    Для DEL (строка только в ONE): ONE — полная строка, TWO — пусто, CHANGE — ключ + «DEL».
+    Для NEW (строка только в TWO): ONE — пусто, TWO — полная строка, CHANGE — ключ + «NEW».
+    Колонки: №, откуда (ONE/TWO/CHANGE), затем все колонки из MERGE.
     """
     if logger:
         logger.debug("Этап: запись листа COMPARE title=%s групп_правок=%d", getattr(ws, "title", "?"), len(compare_groups))
@@ -622,6 +649,8 @@ def _write_compare_sheet(
         row_one = group.get("row_one") or {}
         row_two = group.get("row_two") or {}
         changes = group.get("changes") or {}
+        change_type = group.get("change_type", "CHANGE")
+        key = group.get("key", ())
         # Строка 1: ONE — полная строка из текущего файла
         ws.cell(row=row_idx, column=1, value=change_no)
         ws.cell(row=row_idx, column=2, value="ONE")
@@ -640,11 +669,22 @@ def _write_compare_sheet(
                 val = val[:32767]
             ws.cell(row=row_idx, column=col_idx, value=val)
         row_idx += 1
-        # Строка 3: CHANGE — пометки по колонкам, где были правки
+        # Строка 3: CHANGE — ключ (чтобы было понятно, к какой строке относится) + пометки по колонкам или DEL/NEW
+        first_non_key_col = next((c for c in headers_merge if c not in key_columns), None)
+        col_for_del_new = first_non_key_col if first_non_key_col is not None else (headers_merge[0] if headers_merge else None)
         ws.cell(row=row_idx, column=1, value=change_no)
         ws.cell(row=row_idx, column=2, value="CHANGE")
         for col_idx, col in enumerate(headers_merge, start=3):
-            ws.cell(row=row_idx, column=col_idx, value=changes.get(col, ""))
+            if col in key_columns:
+                idx = key_columns.index(col)
+                val = key[idx] if idx < len(key) else ""
+            elif change_type == "DEL" and col == col_for_del_new:
+                val = "DEL"
+            elif change_type == "NEW" and col == col_for_del_new:
+                val = "NEW"
+            else:
+                val = changes.get(col, "")
+            ws.cell(row=row_idx, column=col_idx, value=val)
         row_idx += 1
     num_cols = len(headers_c)
     for col_idx in range(1, num_cols + 1):
@@ -667,6 +707,7 @@ def _write_excel_in(
         raise RuntimeError("Модуль openpyxl не найден. Установите: conda install openpyxl")
     if logger:
         logger.debug("Этап: запись файла IN (ONE/TWO) путь=%s", output_path)
+    print("  Запись IN (исходные ONE/TWO)...", flush=True)
     wb = openpyxl.Workbook()
     default_sheet = wb.active
     first = True
@@ -705,6 +746,7 @@ def _write_excel_merge(
         raise RuntimeError("Модуль openpyxl не найден. Установите: conda install openpyxl")
     if logger:
         logger.debug("Этап: запись файла MERGE путь=%s", output_path)
+    print("  Запись MERGE (слияние по ключу)...", flush=True)
     wb = openpyxl.Workbook()
     default_sheet = wb.active
     first = True
@@ -735,6 +777,7 @@ def _write_excel_compare(
         raise RuntimeError("Модуль openpyxl не найден. Установите: conda install openpyxl")
     if logger:
         logger.debug("Этап: запись файла COMPARE путь=%s", output_path)
+    print("  Запись COMPARE (список изменений)...", flush=True)
     wb = openpyxl.Workbook()
     default_sheet = wb.active
     first = True
@@ -744,7 +787,7 @@ def _write_excel_compare(
         if first:
             ws.title = title_compare
             first = False
-        _write_compare_sheet(ws, res.compare_groups, res.headers_merge, bold_header=True, logger=logger)
+        _write_compare_sheet(ws, res.compare_groups, res.headers_merge, res.key_columns, bold_header=True, logger=logger)
     wb.save(output_path)
     if logger:
         logger.info("Файл сохранён (COMPARE): %s", output_path)
@@ -824,6 +867,7 @@ def main() -> int:
         return 1
 
     logger.info("Проверка файлов: все указанные файлы найдены")
+    print("  Все файлы на месте. Подготовка списка пар...", flush=True)
     logger.debug("Этап: подготовка списка файлов (пути ONE/TWO, текущий=%s)", CURRENT_FOLDER)
     tasks: list[tuple[dict[str, Any], Optional[str], Optional[str], str, str, list[str]]] = []
     for cfg in INPUT_FILES:
@@ -845,26 +889,35 @@ def main() -> int:
         tasks.append((cfg, path_cur, path_new, current_folder_name, new_folder_name, key_columns))
 
     logger.debug("Подготовка завершена: пар_файлов=%d режим=%s", len(tasks), "последовательно" if NUM_WORKERS <= 1 else f"параллельно (процессов={NUM_WORKERS})")
-    logger.info("Обработка файлов (%d пар)", len(tasks))
+    n_tasks = len(tasks)
+    logger.info("Обработка файлов (%d пар)", n_tasks)
+    print(f"Обработка файлов: {n_tasks} пар.", flush=True)
 
     # Обработка: параллельно или последовательно
     if NUM_WORKERS <= 1:
-        results = [
-            process_one_file(
-                cfg, path_cur, path_new, cur_name, new_name, key_cols, logger=logger
-            )
-            for cfg, path_cur, path_new, cur_name, new_name, key_cols in tasks
-        ]
+        results = []
+        for i, (cfg, path_cur, path_new, cur_name, new_name, key_cols) in enumerate(tasks, start=1):
+            sheet_name = cfg["sheet"]
+            file_one = cfg.get("file_one", "")
+            file_two = cfg.get("file_two", "")
+            print(f"  [{i}/{n_tasks}] Обработка: {sheet_name} ({file_one} / {file_two})", flush=True)
+            res = process_one_file(cfg, path_cur, path_new, cur_name, new_name, key_cols, logger=logger)
+            results.append(res)
+            print(f"         строк MERGE: {len(res.rows_merge)}, изменений: {len(res.compare_groups)}", flush=True)
+        print("Обработка всех пар завершена.", flush=True)
     else:
+        print(f"  Параллельный запуск: {NUM_WORKERS} процессов, {n_tasks} пар.", flush=True)
         worker_args = [
             (cfg, path_cur, path_new, cur_name, new_name, key_cols)
             for cfg, path_cur, path_new, cur_name, new_name, key_cols in tasks
         ]
         with multiprocessing.Pool(processes=NUM_WORKERS) as pool:
             results = pool.map(_worker_process_file, worker_args)
+        print("Параллельная обработка завершена.", flush=True)
 
     logger.debug("Обработка завершена: результатов=%d", len(results))
     logger.info("Запись результата в Excel (3 файла: IN, MERGE, COMPARE)")
+    print("Запись результата в Excel (3 файла: IN, MERGE, COMPARE)...", flush=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H-%M")
     path_in, path_merge, path_compare = write_excel_three_files(
@@ -877,6 +930,7 @@ def main() -> int:
         logger=logger,
     )
     logger.info("Готово. Выходные файлы: IN=%s MERGE=%s COMPARE=%s", path_in, path_merge, path_compare)
+    print("Готово. Файлы сохранены в каталог OUT.", flush=True)
     return 0
 
 
